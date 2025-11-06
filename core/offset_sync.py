@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict, Mapping
+from typing import Any, Dict, Iterable, Mapping
 
 _VALID_DEVICES = {"vp1", "vp2"}
 
@@ -60,6 +60,13 @@ def estimate_offset(sync_point: Dict[str, int]) -> None:
     offset = t_host_ns - t_dev_ns
     _offsets[device] = offset
     _save_offsets()
+
+
+def have_offsets(devices: Iterable[str] | None = None) -> bool:
+    """Return ``True`` if offsets are known for *devices*."""
+
+    required = tuple(devices) if devices is not None else tuple(_VALID_DEVICES)
+    return all(device in _offsets for device in required)
 
 
 def _extract_int(mapping: Mapping[str, Any], *, keys: tuple[str, ...]) -> int:

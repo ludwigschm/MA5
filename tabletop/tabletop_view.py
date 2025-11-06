@@ -43,6 +43,7 @@ from tabletop.overlay.fixation import (
 from tabletop.overlay.process import start_overlay_process, stop_overlay_process
 from tabletop.state.controller import TabletopController, TabletopState
 from tabletop.state.phases import UXPhase, to_engine_phase
+from tabletop.start_gate import StartGate
 from tabletop.ui import widgets as ui_widgets
 from tabletop.engine import POINTS_PER_WIN, EventLogger
 from tabletop.sync.reconciler import TimeReconciler
@@ -205,6 +206,10 @@ class TabletopRoot(FloatLayout):
         self.round_log_writer = None
         self.round_log_buffer = []
         self.overlay_display_index = 0
+        self.start_gate_preroll_s = 5.0
+        self._start_gate: Optional[StartGate] = None
+        self._pending_session_start_payload: Optional[Dict[str, Any]] = None
+        self._session_start_logged = False
 
         self._low_latency_disabled = is_low_latency_disabled()
         self.perf_logging = (
@@ -418,6 +423,78 @@ class TabletopRoot(FloatLayout):
         if self._bridge_recordings_active:
             self._bridge_recording_block = block_value
             self._bridge_state_dirty = False
+
+    def _stop_start_gate(self) -> None:
+        gate = self._start_gate
+        if gate is not None:
+            try:
+                gate.stop()
+            except Exception:  # pragma: no cover - defensive
+                log.debug("Stoppen des Start-Gates fehlgeschlagen", exc_info=True)
+            self._start_gate = None
+
+    def _initiate_start_gate(self) -> None:
+        payload = self._pending_session_start_payload
+        if not payload:
+            return
+        bridge = self._bridge
+        if bridge is None:
+            self._complete_session_start()
+            return
+        players = sorted(self._bridge_players) if self._bridge_players else []
+        if not players:
+            with suppress(AttributeError):
+                detected = bridge.connected_players()
+                if detected:
+                    players = sorted(p for p in detected if p)
+        if not players:
+            self._complete_session_start()
+            return
+        self._stop_start_gate()
+        logger = log.getChild("start_gate") if hasattr(log, "getChild") else log
+
+        def _ready() -> None:
+            Clock.schedule_once(self._on_start_gate_ready, 0.0)
+
+        try:
+            gate = StartGate(
+                bridge,
+                players=tuple(players),
+                sensors=StartGate.DEFAULT_SENSORS,
+                poll_interval=0.5,
+                logger=logger,
+                offset_devices=("vp1", "vp2"),
+            )
+        except Exception:  # pragma: no cover - defensive
+            log.exception("Start-Gate konnte nicht initialisiert werden")
+            self._complete_session_start()
+            return
+        self._start_gate = gate
+        try:
+            gate.start(_ready)
+        except Exception:  # pragma: no cover - defensive
+            log.exception("Start-Gate konnte nicht gestartet werden")
+            self._complete_session_start()
+
+    def _on_start_gate_ready(self, _dt: float) -> None:
+        delay = max(0.0, float(self.start_gate_preroll_s))
+        if delay <= 0:
+            self._complete_session_start()
+            return
+        Clock.schedule_once(self._complete_session_start, delay)
+
+    def _complete_session_start(self, _dt: float = 0.0) -> None:
+        if self._session_start_logged:
+            return
+        payload = self._pending_session_start_payload
+        if not payload:
+            return
+        self._stop_start_gate()
+        log.info("START-GATE: all green")
+        self.log_event(None, 'session_start', dict(payload))
+        self.send_bridge_event('session_start', dict(payload))
+        self._session_start_logged = True
+        self._pending_session_start_payload = None
         else:
             self._bridge_state_dirty = True
         self._next_bridge_check = now + self._bridge_check_interval
@@ -533,6 +610,7 @@ class TabletopRoot(FloatLayout):
 
     def shutdown_sync_services(self) -> None:
         self._cancel_sync_heartbeat()
+        self._stop_start_gate()
         reconciler = self._time_reconciler
         if reconciler is not None:
             try:
@@ -708,6 +786,7 @@ class TabletopRoot(FloatLayout):
             for ch in self.session_id
         ) or 'session'
 
+        self._stop_start_gate()
         self.session_configured = True
         self.log_dir.mkdir(parents=True, exist_ok=True)
         db_path = self.log_dir / f'events_{safe_session_id}.sqlite3'
@@ -718,19 +797,17 @@ class TabletopRoot(FloatLayout):
         init_round_log(self)
         self.update_role_assignments()
 
-        self.log_event(
-            None,
-            'session_start',
-            {
-                'session_number': self.session_number,
-                'session_id': self.session_id,
-                'aruco_enabled': self.aruco_enabled,
-                'start_block': self.start_block,
-            },
-        )
+        self._pending_session_start_payload = {
+            'session_number': self.session_number,
+            'session_id': self.session_id,
+            'aruco_enabled': self.aruco_enabled,
+            'start_block': self.start_block,
+        }
+        self._session_start_logged = False
         self._mark_bridge_dirty()
         self._ensure_bridge_recordings()
         self._apply_session_options_and_start()
+        self._initiate_start_gate()
 
     def _configure_session_from_cli(self, *_args: Any) -> None:
         if self.session_configured:
