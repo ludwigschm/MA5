@@ -7,7 +7,6 @@ import logging
 import queue
 import threading
 import time
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -16,6 +15,7 @@ try:  # Optional dependency used when available.
 except Exception:  # pragma: no cover - pandas is optional at runtime
     _pd = None
 
+from core.clock import Clock
 from tabletop.utils.runtime import (
     is_low_latency_disabled,
     is_perf_logging_enabled,
@@ -216,7 +216,7 @@ def write_round_log(app: Any, actor: str, action: str, payload: Dict[str, Any], 
             spieler1_vp = f"VP{vp_player1}"
 
     action_label = round_log_action_label(app, action, payload)
-    timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    timestamp = Clock.ns_to_local_str(Clock.now_ns(), "%H:%M:%S.%f")[:-3]
 
     winner_label = ""
     if is_showdown:

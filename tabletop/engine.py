@@ -18,13 +18,13 @@ import sqlite3
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:  # pragma: no cover - only for static typing
     from tabletop.logging.events import Events
 
+from core.clock import Clock
 from tabletop.utils.runtime import (
     is_low_latency_disabled,
     is_perf_logging_enabled,
@@ -353,8 +353,8 @@ class EventLogger:
         action: str,
         payload: Dict[str, Any],
     ) -> Dict[str, Any]:
-        t_mono_ns = time.perf_counter_ns()
-        t_utc_iso = datetime.now(timezone.utc).isoformat()
+        t_mono_ns = Clock.now_ns()
+        t_utc_iso = Clock.ns_to_utc_iso(t_mono_ns)
         row = (
             session_id,
             round_idx,
@@ -426,7 +426,7 @@ class EventLogger:
         confidence: float,
         reason: str,
     ) -> None:
-        timestamp = datetime.now(timezone.utc).isoformat()
+        timestamp = Clock.ns_to_utc_iso(Clock.now_ns())
         with self._db_lock:
             self.conn.execute(
                 """
