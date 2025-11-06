@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Literal, Optional, Union
 
 from core.capabilities import CapabilityRegistry, DeviceCapabilities
+from core.clock import Clock
 from core.device_registry import DeviceRegistry
 from core.event_router import EventRouter, UIEvent
 from core.recording import DeviceClient, RecordingController, RecordingHttpError
@@ -499,7 +500,7 @@ class PupilBridge:
         if self._active_recording.get(player):
             log.info("recording.start übersprungen (%s bereits aktiv)", player)
             return
-        label = f"auto.{player.lower()}.{int(time.time())}"
+        label = f"auto.{player.lower()}.{Clock.now_ns()}"
         controller = self._recording_controllers.get(player)
         if controller is None:
             cfg = self._device_config.get(player)
