@@ -6,5 +6,6 @@ __all__ = [
     "event_router",
     "logging",
     "recording",
+    "single_writer_logger",
     "time_sync",
 ]
