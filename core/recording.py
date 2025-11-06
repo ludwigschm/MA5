@@ -86,13 +86,15 @@ class RecordingController:
 
         raise RecordingHttpError(503, "recording start retries exhausted", transient=True)
 
-    async def begin_segment(self, deadline_ms: int = 500) -> None:
+    async def begin_segment(self, deadline_ms: int = 8000) -> None:
         """Trigger a recording segment begin event with a strict timeout."""
 
         if not self._active:
             return
         try:
-            await asyncio.wait_for(self._client.recording_begin(), timeout=deadline_ms / 1000)
+            await asyncio.wait_for(
+                self._client.recording_begin(), timeout=deadline_ms / 1000
+            )
         except asyncio.TimeoutError:
             self._log.warning("recording begin timeout; best-effort continue")
         else:

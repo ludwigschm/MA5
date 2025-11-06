@@ -66,6 +66,9 @@ def test_recording_start_idempotent(bridge):
     pupil_bridge.start_recording(1, 1, "VP1")
     pupil_bridge.start_recording(1, 1, "VP1")
     assert device.start_calls == 1
+    metadata = pupil_bridge._recording_metadata.get("VP1")  # type: ignore[attr-defined]
+    assert metadata is not None
+    assert metadata.get("recording_id") == "fake"
 
 
 def test_time_sync_manager_used_for_offsets(bridge):

@@ -149,6 +149,7 @@ class _BridgeDeviceClient(DeviceClient):
             )
             if info is None:
                 raise asyncio.TimeoutError()
+            self._bridge._on_recording_begin(self._player, info)
 
         await asyncio.to_thread(_begin)
 
@@ -258,6 +259,7 @@ class PupilBridge:
         self._device_by_player: Dict[str, Any] = {"VP1": None, "VP2": None}
         self._active_recording: Dict[str, bool] = {"VP1": False, "VP2": False}
         self._recording_metadata: Dict[str, Dict[str, Any]] = {}
+        self._pending_recording_ids: Dict[str, str] = {}
         self._auto_session: Optional[int] = None
         self._auto_block: Optional[int] = None
         self._auto_players: set[str] = set()
@@ -1121,15 +1123,18 @@ class PupilBridge:
             log.warning("recording start error player=%s error=%s", player, exc)
             return
 
+        recording_id = self._pending_recording_ids.pop(player, None)
         payload = {
             "session": session,
             "block": block,
             "player": player,
             "recording_label": recording_label,
-            "recording_id": None,
+            "recording_id": recording_id,
         }
         self._active_recording[player] = True
         self._recording_metadata[player] = payload
+        if recording_id:
+            log.info("recording.begin bestätigt (%s, id=%s)", player, recording_id)
         self.send_event("session.recording_started", player, payload)
 
     def _send_recording_start(
@@ -1411,12 +1416,93 @@ class PupilBridge:
                     log.debug("Warten auf %s via %s fehlgeschlagen", event, attr, exc_info=True)
         return None
 
+    def _on_recording_begin(self, player: str, info: Any) -> None:
+        recording_id = self._extract_recording_id(info)
+        if not recording_id:
+            return
+        metadata = self._recording_metadata.get(player)
+        if metadata is not None:
+            metadata["recording_id"] = recording_id
+        else:
+            self._pending_recording_ids[player] = recording_id
+
     def _extract_recording_id(self, info: Any) -> Optional[str]:
         if isinstance(info, dict):
             for key in ("recording_id", "id", "uuid"):
                 value = info.get(key)
                 if value:
                     return str(value)
+        return None
+
+    def _extract_sensor_snapshot(self, status: Any) -> Dict[str, bool]:
+        result: Dict[str, bool] = {}
+
+        def record(name: Any, entry: Any) -> None:
+            if not name:
+                return
+            value = self._coerce_sensor_value(entry)
+            if value is None:
+                return
+            result[str(name)] = value
+
+        if isinstance(status, dict):
+            for name, entry in status.items():
+                if isinstance(entry, (dict, list)):
+                    record(name, entry)
+            for key in ("sensors", "sensor", "streams", "devices", "modules", "services"):
+                container = status.get(key)
+                if isinstance(container, dict):
+                    for name, entry in container.items():
+                        record(name, entry)
+                elif isinstance(container, list):
+                    for item in container:
+                        if isinstance(item, dict):
+                            label = (
+                                item.get("name")
+                                or item.get("sensor")
+                                or item.get("id")
+                                or item.get("source")
+                            )
+                            record(label, item)
+        elif isinstance(status, list):
+            for item in status:
+                if isinstance(item, dict):
+                    label = (
+                        item.get("name")
+                        or item.get("sensor")
+                        or item.get("id")
+                        or item.get("source")
+                    )
+                    record(label, item)
+
+        return result
+
+    def _coerce_sensor_value(self, value: Any) -> Optional[bool]:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if not lowered:
+                return None
+            if lowered in {"true", "1", "yes", "connected", "ready", "ok", "active"}:
+                return True
+            if lowered in {"false", "0", "no", "disconnected", "offline", "inactive"}:
+                return False
+            return None
+        if isinstance(value, dict):
+            for key in ("connected", "ready", "status", "value", "active", "enabled"):
+                if key not in value:
+                    continue
+                candidate = self._coerce_sensor_value(value[key])
+                if candidate is not None:
+                    return candidate
+        if isinstance(value, list):
+            for item in value:
+                candidate = self._coerce_sensor_value(item)
+                if candidate is not None:
+                    return candidate
         return None
 
     def stop_recording(self, player: str) -> None:
@@ -1470,6 +1556,32 @@ class PupilBridge:
             for player, device in self._device_by_player.items()
             if device is not None
         ]
+
+    def get_sensor_snapshot(self, player: str) -> Dict[str, bool]:
+        """Return the connection status for relevant sensors of *player*."""
+
+        device = self._device_by_player.get(player)
+        if device is None:
+            return {}
+        try:
+            status = self._get_device_status(device)
+        except Exception:  # pragma: no cover - defensive
+            log.debug("Sensorstatus konnte nicht abgefragt werden (%s)", player, exc_info=True)
+            return {}
+        return self._extract_sensor_snapshot(status)
+
+    def get_recording_id(self, player: str) -> Optional[str]:
+        """Return the current recording identifier for *player* if known."""
+
+        metadata = self._recording_metadata.get(player)
+        if not metadata:
+            pending = self._pending_recording_ids.get(player)
+            return pending
+        recording_id = metadata.get("recording_id")
+        if recording_id:
+            return str(recording_id)
+        pending = self._pending_recording_ids.get(player)
+        return pending
 
     # ------------------------------------------------------------------
     # Event helpers
