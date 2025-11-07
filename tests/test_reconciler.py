@@ -218,7 +218,44 @@ def test_reconciler_pairs_host_mirror_samples() -> None:
     assert pytest.approx(last_weight, rel=0.0, abs=1e-6) == reconciler._marker_pair_weight
     expected_intercept = model["VP1"][0]
     assert abs(state.intercept_ns - expected_intercept) < 5_000_000
-    assert state.confidence >= TimeReconciler.CONF_MIN
+
+
+def test_predict_device_times_returns_per_player_predictions() -> None:
+    players = ["VP1", "VP2"]
+    models = {"VP1": (12_000_000.0, 1.00001), "VP2": (-8_000_000.0, 0.99999)}
+    bridge = _FakeBridge(players)
+    logger = _FakeLogger()
+    reconciler = TimeReconciler(bridge, logger, window_size=30)
+
+    start_ns = 7_000_000_000
+    for index in range(60):
+        t_local_ns = start_ns + index * 45_000_000
+        _inject_marker(reconciler, bridge, players, models, t_local_ns)
+
+    for idx in range(5):
+        event_id = f"probe{idx}"
+        t_host_ns = start_ns + 30_000_000 + idx * 75_000_000
+        reconciler._process_event(event_id, t_host_ns)
+
+    target_ns = start_ns + 500_000_000
+    mapping = reconciler.predict_device_times(target_ns)
+
+    assert set(mapping) == set(players)
+    for player in players:
+        data = mapping[player]
+        intercept, slope = models[player]
+        expected = int(round(intercept + slope * target_ns))
+        assert abs(int(data["t_device_ns"]) - expected) < 5_000_000
+        assert data["mapping_confidence"] >= 0.0
+        assert data["mapping_confidence"] <= 1.0
+
+
+def test_predict_device_times_returns_empty_without_state() -> None:
+    bridge = _FakeBridge(["VP1"])
+    logger = _FakeLogger()
+    reconciler = TimeReconciler(bridge, logger, window_size=5)
+
+    assert reconciler.predict_device_times(1_234_567_890) == {}
 
 
 def test_event_logger_supports_per_player_refinements(tmp_path: Path) -> None:

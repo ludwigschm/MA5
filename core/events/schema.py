@@ -28,6 +28,8 @@ class BaseEventRequired(TypedDict):
 
 class BaseEvent(BaseEventRequired, total=False):
     t_device_ns: Optional[int]
+    t_device_vp1_ns: Optional[int]
+    t_device_vp2_ns: Optional[int]
     mapping_version: Optional[int]
     mapping_confidence: Optional[float]
     mapping_rms_ns: Optional[int]
@@ -54,6 +56,8 @@ _REQUIRED_FIELD_SPECS = (
 
 _OPTIONAL_FIELD_SPECS = (
     _FieldSpec("t_device_ns", (int,), optional=True, allow_none=True),
+    _FieldSpec("t_device_vp1_ns", (int,), optional=True, allow_none=True),
+    _FieldSpec("t_device_vp2_ns", (int,), optional=True, allow_none=True),
     _FieldSpec("mapping_version", (int,), optional=True, allow_none=True),
     _FieldSpec("mapping_confidence", (float,), optional=True, allow_none=True),
     _FieldSpec("mapping_rms_ns", (int,), optional=True, allow_none=True),

@@ -6,13 +6,14 @@ import logging
 import sqlite3
 import threading
 from contextlib import suppress
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 from core.events import BaseEvent, CloudClient, Priority, validate_base_event
 from core.single_writer_logger import SingleWriterLogger
 
-__all__ = ["UIEventLocalLogger", "UIEventSender"]
+__all__ = ["UIEventLocalLogger", "UIEventSender", "log_mapping_warning"]
 
 log = logging.getLogger(__name__)
 
@@ -26,11 +27,46 @@ _CSV_FIELDS = (
     "action",
     "t_ui_mono_ns",
     "t_device_ns",
+    "t_device_vp1_ns",
+    "t_device_vp2_ns",
     "mapping_version",
     "mapping_confidence",
     "mapping_rms_ns",
     "t_utc_iso",
 )
+
+_COLUMN_TYPES = {
+    "session_id": "TEXT",
+    "block_idx": "INTEGER",
+    "trial_idx": "INTEGER",
+    "actor": "TEXT",
+    "player1_id": "TEXT",
+    "action": "TEXT",
+    "t_ui_mono_ns": "INTEGER",
+    "t_device_ns": "INTEGER",
+    "t_device_vp1_ns": "INTEGER",
+    "t_device_vp2_ns": "INTEGER",
+    "mapping_version": "INTEGER",
+    "mapping_confidence": "REAL",
+    "mapping_rms_ns": "INTEGER",
+    "t_utc_iso": "TEXT",
+}
+
+_SQL_COLUMNS = ", ".join(_CSV_FIELDS)
+_SQL_PLACEHOLDERS = ", ".join("?" for _ in _CSV_FIELDS)
+_MAPPING_WARNINGS_PATH = Path("logs/mapping_warnings.log")
+
+
+def log_mapping_warning(message: str) -> None:
+    """Append *message* to the mapping warnings log with a UTC timestamp."""
+
+    try:
+        _MAPPING_WARNINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.utcnow().isoformat(timespec="milliseconds") + "Z"
+        with _MAPPING_WARNINGS_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(f"{timestamp} {message}\n")
+    except Exception:  # pragma: no cover - best effort logging
+        log.debug("Failed to record mapping warning", exc_info=True)
 
 
 class UIEventLocalLogger:
@@ -71,6 +107,8 @@ class UIEventLocalLogger:
                   action TEXT,
                   t_ui_mono_ns INTEGER,
                   t_device_ns INTEGER,
+                  t_device_vp1_ns INTEGER,
+                  t_device_vp2_ns INTEGER,
                   mapping_version INTEGER,
                   mapping_confidence REAL,
                   mapping_rms_ns INTEGER,
@@ -78,6 +116,7 @@ class UIEventLocalLogger:
                 )
                 """
             )
+            self._ensure_schema_locked()
             self._conn.commit()
         self._closed = False
 
@@ -94,7 +133,8 @@ class UIEventLocalLogger:
         values = tuple(payload.get(key) for key in _CSV_FIELDS)
         with self._lock:
             self._conn.execute(
-                "INSERT INTO ui_events VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", values
+                f"INSERT INTO ui_events ({_SQL_COLUMNS}) VALUES ({_SQL_PLACEHOLDERS})",
+                values,
             )
             self._conn.commit()
 
@@ -108,6 +148,17 @@ class UIEventLocalLogger:
             with suppress(Exception):
                 self._conn.commit()
                 self._conn.close()
+
+    def _ensure_schema_locked(self) -> None:
+        cur = self._conn.cursor()
+        cur.execute("PRAGMA table_info(ui_events)")
+        existing = {row[1] for row in cur.fetchall()}
+        for column, column_type in _COLUMN_TYPES.items():
+            if column in existing:
+                continue
+            self._conn.execute(
+                f"ALTER TABLE ui_events ADD COLUMN {column} {column_type}"
+            )
 
 
 class UIEventSender:

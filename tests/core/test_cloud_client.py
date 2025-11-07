@@ -63,6 +63,8 @@ def test_payload_limited_to_whitelist_fields():
         client.send_event(
             _base_event(
                 t_device_ns=99,
+                t_device_vp1_ns=101,
+                t_device_vp2_ns=202,
                 mapping_version=7,
                 mapping_confidence=0.9,
                 mapping_rms_ns=42,
