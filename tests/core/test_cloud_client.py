@@ -1,0 +1,116 @@
+import json
+import time
+from pathlib import Path
+from typing import List
+
+from core.events import CloudClient
+
+
+def _base_event(**overrides):
+    event = {
+        "session_id": "sess-1",
+        "block_idx": 0,
+        "trial_idx": 1,
+        "actor": "player",
+        "player1_id": "p1",
+        "action": "bet",
+        "t_ui_mono_ns": 1234567890,
+    }
+    event.update(overrides)
+    return event
+
+
+class _TransportSpy:
+    def __init__(self) -> None:
+        self.calls: List[str] = []
+
+    def __call__(self, payload: str) -> None:
+        self.calls.append(payload)
+
+
+def test_high_priority_triggers_immediate_send():
+    spy = _TransportSpy()
+    client = CloudClient(spy, batch_window_s=0.5, batch_size=5)
+    try:
+        client.send_event(_base_event(trial_idx=5), priority="high")
+        assert len(spy.calls) == 1
+        sent = json.loads(spy.calls[0])
+        assert len(sent) == 1
+        assert sent[0]["trial_idx"] == 5
+    finally:
+        client.close()
+
+
+def test_normal_priority_batches_after_window():
+    spy = _TransportSpy()
+    client = CloudClient(spy, batch_window_s=0.05, batch_size=10)
+    try:
+        client.send_event(_base_event(trial_idx=2))
+        client.send_event(_base_event(trial_idx=3))
+        assert spy.calls == []
+        time.sleep(0.08)
+        assert len(spy.calls) == 1
+        payload = json.loads(spy.calls[0])
+        assert [item["trial_idx"] for item in payload] == [2, 3]
+    finally:
+        client.close()
+
+
+def test_payload_limited_to_whitelist_fields():
+    spy = _TransportSpy()
+    client = CloudClient(spy, batch_window_s=0.5, batch_size=5)
+    try:
+        client.send_event(
+            _base_event(
+                t_device_ns=99,
+                mapping_version=7,
+                mapping_confidence=0.9,
+                mapping_rms_ns=42,
+                t_utc_iso="2024-01-01T00:00:00Z",
+            ),
+            priority="high",
+        )
+        sent = json.loads(spy.calls[0])[0]
+        assert set(sent.keys()) == {
+            "session_id",
+            "block_idx",
+            "trial_idx",
+            "actor",
+            "player1_id",
+            "action",
+            "t_ui_mono_ns",
+            "t_device_ns",
+            "mapping_version",
+            "mapping_confidence",
+        }
+        assert "mapping_rms_ns" not in sent
+        assert "t_utc_iso" not in sent
+    finally:
+        client.close()
+
+
+def test_invalid_event_logged_and_not_sent(tmp_path: Path):
+    error_log = Path("logs/event_errors.log")
+    if error_log.exists():
+        error_log.unlink()
+    spy = _TransportSpy()
+    client = CloudClient(spy, batch_window_s=0.05, batch_size=5)
+    try:
+        client.send_event(
+            {
+                "session_id": "sess-2",
+                "block_idx": 1,
+                "trial_idx": 2,
+                "actor": "player",
+                "player1_id": "p1",
+                "t_ui_mono_ns": 42,
+            }
+        )
+        time.sleep(0.02)
+        assert spy.calls == []
+    finally:
+        client.close()
+
+    assert error_log.exists()
+    contents = error_log.read_text(encoding="utf-8")
+    assert "Missing required field: action" in contents
