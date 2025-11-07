@@ -6,20 +6,18 @@ import json
 import logging
 import queue
 import threading
-import time
 from collections import deque
-from pathlib import Path
 from typing import Callable, Deque, Dict, Iterable, Literal, Mapping, MutableSequence, Tuple
 
 from core.config import EVENT_BATCH_SIZE, EVENT_BATCH_WINDOW_MS
 
+from .error_logger import log_event_error, reason_from_exception
 from .schema import BaseEvent, validate_base_event
 
 Priority = Literal["high", "normal"]
 
 log = logging.getLogger(__name__)
 
-_ERROR_LOG_PATH = Path("logs/event_errors.log")
 _ALLOWED_FIELDS: tuple[str, ...] = (
     "session_id",
     "block_idx",
@@ -81,7 +79,7 @@ class CloudClient:
         try:
             validated = validate_base_event(payload)
         except ValueError as exc:
-            self._log_validation_error(payload, exc)
+            log_event_error(reason_from_exception(exc), payload)
             return
 
         filtered: Dict[str, object] = {}
@@ -198,24 +196,6 @@ class CloudClient:
                 self._queue.appendleft(event)
             if self._timer is None:
                 self._schedule_timer_locked()
-
-    def _log_validation_error(
-        self, payload: Mapping[str, object], exc: Exception
-    ) -> None:
-        try:
-            _ERROR_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-            timestamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
-            try:
-                payload_repr = json.dumps(payload, ensure_ascii=False, default=str)
-            except TypeError:
-                payload_repr = repr(dict(payload))
-            with _ERROR_LOG_PATH.open("a", encoding="utf-8") as fh:
-                fh.write(
-                    f"{timestamp} validation_error: {exc} payload={payload_repr}\n"
-                )
-        except Exception:  # pragma: no cover - defensive logging
-            log.exception("Failed to log validation error")
-
 
     def _drain_high_priority_queue(self) -> None:
         while True:

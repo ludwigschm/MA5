@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Optional
 
 from core.events import BaseEvent, CloudClient, Priority, validate_base_event
+from core.events.error_logger import log_event_error, reason_from_exception
 from core.single_writer_logger import SingleWriterLogger
 
 __all__ = ["UIEventLocalLogger", "UIEventSender", "log_mapping_warning"]
@@ -181,8 +182,9 @@ class UIEventSender:
     def send_event(self, payload: BaseEvent, priority: Priority = "normal") -> None:
         try:
             validated = validate_base_event(payload)
-        except ValueError:
-            log.exception("UI event payload failed validation")
+        except ValueError as exc:
+            log_event_error(reason_from_exception(exc), payload)
+            log.warning("UI event payload failed validation: %s", exc)
             return
 
         with self._sequence_lock:
