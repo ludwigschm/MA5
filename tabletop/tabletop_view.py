@@ -25,9 +25,13 @@ from kivy.uix.spinner import Spinner
 from kivy.uix.switch import Switch
 from kivy.uix.textinput import TextInput
 
+from cloud import client as cloud_client
+from cloud.config import CFG as CLOUD_CFG
+from cloud.payload import build_cloud_payload
+from core.config import CLOUD_SESSION_ID_REQUIRED
+from core.events import BaseEvent, Priority
 from tabletop.data.blocks import load_blocks, load_csv_rounds, value_to_card_path
 from tabletop.data.config import ARUCO_OVERLAY_PATH, ROOT
-from core.events import BaseEvent, Priority
 from tabletop.logging import async_bridge
 from tabletop.logging.events import Events
 from tabletop.logging.policy import event_priority_for_action
@@ -569,6 +573,43 @@ class TabletopRoot(FloatLayout):
         if role in (1, 2):
             return f"VP{role}"
         return None
+
+    def _append_minimal_cloud_event(
+        self, *, action: str, player: int, idempotency_key: str
+    ) -> None:
+        if not idempotency_key or player not in (1, 2):
+            return
+
+        cloud_actor = self._cloud_actor_label(player)
+        if cloud_actor is None:
+            return
+
+        player1_id = self._player1_identifier()
+        if not player1_id:
+            return
+
+        session_id = CLOUD_CFG.SESSION_ID if CLOUD_SESSION_ID_REQUIRED else None
+        if CLOUD_SESSION_ID_REQUIRED and not session_id:
+            log.warning(
+                "Skipping cloud dispatch for %s: missing session identifier", action
+            )
+            return
+
+        try:
+            payload = build_cloud_payload(
+                action=action,
+                actor=cloud_actor,
+                player1_id=player1_id,
+                session_id=session_id,
+            )
+        except Exception:
+            log.exception("Failed to construct cloud payload for %s", action)
+            return
+
+        try:
+            cloud_client.append_event(payload, idempotency_key=idempotency_key)
+        except Exception:
+            log.exception("Failed to append cloud event for %s", action)
 
     def _current_trial_index(self) -> Optional[int]:
         try:
@@ -1480,6 +1521,7 @@ class TabletopRoot(FloatLayout):
 
     def start_pressed(self, who:int):
         started = time.perf_counter()
+        idempotency_key = uuid.uuid4().hex
         try:
             if not self._input_debouncer.allow(f"start:{who}", interval_override_ms=10.0):
                 return
@@ -1490,6 +1532,9 @@ class TabletopRoot(FloatLayout):
                 return
             t0_ns = time.monotonic_ns()
             actor = self._actor_label(who)
+            self._append_minimal_cloud_event(
+                action="phase_transition", player=who, idempotency_key=idempotency_key
+            )
             payload = self._build_ui_event_payload(
                 action="phase_transition", actor=actor, t_ui_ns=t0_ns
             )
@@ -1556,6 +1601,7 @@ class TabletopRoot(FloatLayout):
 
     def tap_card(self, who:int, which:str):
         started = time.perf_counter()
+        idempotency_key = uuid.uuid4().hex
         try:
             if not self._input_debouncer.allow(f"tap:{who}:{which}"):
                 return
@@ -1573,6 +1619,9 @@ class TabletopRoot(FloatLayout):
             if not result.allowed:
                 return
             actor = self._actor_label(who)
+            self._append_minimal_cloud_event(
+                action="card_flip", player=who, idempotency_key=idempotency_key
+            )
             payload = self._build_ui_event_payload(
                 action="card_flip", actor=actor, t_ui_ns=t0_ns
             )
@@ -1593,6 +1642,7 @@ class TabletopRoot(FloatLayout):
 
     def pick_signal(self, player:int, level:str):
         started = time.perf_counter()
+        idempotency_key = uuid.uuid4().hex
         try:
             if not self._input_debouncer.allow(f"signal:{player}:{level}"):
                 return
@@ -1609,6 +1659,9 @@ class TabletopRoot(FloatLayout):
             if not result.accepted:
                 return
             actor = self._actor_label(player)
+            self._append_minimal_cloud_event(
+                action="bet", player=player, idempotency_key=idempotency_key
+            )
             payload = self._build_ui_event_payload(
                 action="bet", actor=actor, t_ui_ns=t0_ns
             )
@@ -1635,6 +1688,7 @@ class TabletopRoot(FloatLayout):
 
     def pick_decision(self, player:int, decision:str):
         started = time.perf_counter()
+        idempotency_key = uuid.uuid4().hex
         try:
             if not self._input_debouncer.allow(f"decision:{player}:{decision}"):
                 return
@@ -1652,6 +1706,9 @@ class TabletopRoot(FloatLayout):
                 return
             actor = self._actor_label(player)
             action_label = "call" if decision == "wahr" else "fold"
+            self._append_minimal_cloud_event(
+                action=action_label, player=player, idempotency_key=idempotency_key
+            )
             payload = self._build_ui_event_payload(
                 action=action_label, actor=actor, t_ui_ns=t0_ns
             )
@@ -2113,6 +2170,18 @@ class TabletopRoot(FloatLayout):
         if role == 2:
             return "P2"
         return "P1" if player == 1 else "P2"
+
+    def _cloud_actor_label(self, player: Optional[int]) -> Optional[str]:
+        if player not in (1, 2):
+            return None
+        role = None
+        try:
+            role = self.player_roles.get(player)
+        except Exception:
+            role = None
+        if role in (1, 2):
+            return f"VP{role}"
+        return f"VP{player}"
 
     def log_event(self, player: int, action: str, payload=None):
         if not self.logger or not self.session_configured:
