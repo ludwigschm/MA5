@@ -649,59 +649,61 @@ class TabletopRoot(FloatLayout):
             self._record_mapping_warning(payload, "reconciler_unavailable")
             return fields
 
-        mapping = reconciler.predict_device_times(int(t_ui_ns))
-        if not mapping:
-            self._record_mapping_warning(payload, "mapping_unavailable")
-            return fields
+        mapping_results: Dict[str, Any] = {}
+        for alias, tracker in (("vp1", "VP1"), ("vp2", "VP2")):
+            result = reconciler.map_host_to_device(int(t_ui_ns), tracker)
+            mapping_results[alias] = result
+            if result.t_device_ns is not None:
+                fields[f"t_device_{alias}_ns"] = int(result.t_device_ns)
 
-        per_device: Dict[str, Dict[str, Any]] = {}
-        for player, info in mapping.items():
-            lowered = str(player).strip().lower()
-            alias: Optional[str] = None
-            if lowered.endswith("vp1") or lowered.endswith("p1") or lowered == "vp1":
-                alias = "vp1"
-            elif lowered.endswith("vp2") or lowered.endswith("p2") or lowered == "vp2":
-                alias = "vp2"
-            if alias is not None:
-                per_device[alias] = info
-            else:
-                per_device[lowered] = info
-
-        if "vp1" in per_device:
-            t_vp1 = per_device["vp1"].get("t_device_ns")
-            fields["t_device_vp1_ns"] = int(t_vp1) if t_vp1 is not None else None
-        if "vp2" in per_device:
-            t_vp2 = per_device["vp2"].get("t_device_ns")
-            fields["t_device_vp2_ns"] = int(t_vp2) if t_vp2 is not None else None
-
-        chosen: Optional[Dict[str, Any]] = None
         actor = str(payload.get("actor", "")).upper()
+        chosen_result = None
         if actor == "P1":
-            chosen = per_device.get("vp1")
+            chosen_result = mapping_results.get("vp1")
         elif actor == "P2":
-            chosen = per_device.get("vp2")
+            chosen_result = mapping_results.get("vp2")
 
-        if chosen is None and len(per_device) == 1:
-            chosen = next(iter(per_device.values()))
-        if chosen is None:
-            chosen = per_device.get("vp1") or per_device.get("vp2")
-        if chosen is None and mapping:
-            chosen = next(iter(mapping.values()))
+        if chosen_result is None or getattr(chosen_result, "t_device_ns", None) is None:
+            for alias in ("vp1", "vp2"):
+                candidate = mapping_results.get(alias)
+                if candidate is None:
+                    continue
+                if chosen_result is None:
+                    chosen_result = candidate
+                if getattr(candidate, "t_device_ns", None) is not None:
+                    chosen_result = candidate
+                    break
 
-        if chosen is not None:
-            t_device = chosen.get("t_device_ns")
-            fields["t_device_ns"] = int(t_device) if t_device is not None else None
-
-            version = chosen.get("mapping_version")
-            fields["mapping_version"] = int(version) if version is not None else None
-
-            confidence = chosen.get("mapping_confidence")
-            fields["mapping_confidence"] = (
-                float(confidence) if confidence is not None else None
+        fallback_result = reconciler.map_host_to_device(int(t_ui_ns))
+        if (
+            chosen_result is None
+            or (
+                getattr(chosen_result, "t_device_ns", None) is None
+                and getattr(fallback_result, "t_device_ns", None) is not None
             )
+        ):
+            chosen_result = fallback_result
 
-            rms = chosen.get("mapping_rms_ns")
-            fields["mapping_rms_ns"] = int(rms) if rms is not None else None
+        if chosen_result is None:
+            chosen_result = fallback_result
+
+        if chosen_result.t_device_ns is not None:
+            fields["t_device_ns"] = int(chosen_result.t_device_ns)
+
+        fields["mapping_version"] = int(chosen_result.mapping_version)
+        fields["mapping_confidence"] = float(chosen_result.confidence)
+        fields["mapping_rms_ns"] = int(chosen_result.rms_ns)
+
+        if chosen_result.t_device_ns is None:
+            all_results = list(mapping_results.values()) + [fallback_result]
+            has_mapping_data = any(
+                getattr(result, "mapping_version", 0) > 0
+                or getattr(result, "confidence", 0.0) > 0.0
+                or getattr(result, "rms_ns", 0) > 0
+                for result in all_results
+            )
+            reason = "mapping_unstable" if has_mapping_data else "mapping_unavailable"
+            self._record_mapping_warning(payload, reason)
 
         return fields
 

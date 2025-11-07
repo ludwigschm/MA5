@@ -12,6 +12,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple
 
+from core.config import QC_CONFIDENCE_MIN, QC_RMS_NS_THRESHOLD
 from tabletop.engine import EventLogger
 from tabletop.pupil_bridge import PupilBridge
 
@@ -37,6 +38,14 @@ REREFINE_EVENT_WINDOW = 200
 REREFINE_RATE_LIMIT_S = 120.0
 REREFINE_RMS_IMPROVEMENT_MS = 1.0
 REREFINE_CONF_IMPROVEMENT = 0.10
+
+@dataclass(frozen=True)
+class MappingResult:
+    t_device_ns: Optional[int]
+    mapping_version: int
+    confidence: float
+    rms_ns: int
+
 
 @dataclass
 class _DeviceMarkerEvent:
@@ -147,54 +156,140 @@ class TimeReconciler:
                 return 0
             return max(state.mapping_version for state in self._player_states.values())
 
+    # ------------------------------------------------------------------
+    def map_host_to_device(
+        self, t_ui_mono_ns: int, tracker_id: Optional[str] = None
+    ) -> MappingResult:
+        """Map *t_ui_mono_ns* to device time for *tracker_id* if available."""
+
+        snapshot = self._mapping_state_snapshot()
+        return self._map_host_to_device_from_snapshot(snapshot, t_ui_mono_ns, tracker_id)
+
     def predict_device_times(self, t_host_ns: int) -> Dict[str, Dict[str, float]]:
         """Return predicted device timestamps and metadata for *t_host_ns*."""
 
+        snapshot = self._mapping_state_snapshot()
+
+        predictions: Dict[str, Dict[str, float]] = {}
+        for entry in snapshot:
+            (
+                player,
+                intercept,
+                slope,
+                _,
+                _,
+                _,
+                _,
+            ) = entry
+            mapping = self._map_host_to_device_from_snapshot(
+                snapshot, t_host_ns, player
+            )
+            predictions[player] = {
+                "t_device_ns": float(mapping.t_device_ns)
+                if mapping.t_device_ns is not None
+                else None,
+                "mapping_version": float(mapping.mapping_version),
+                "mapping_confidence": float(mapping.confidence),
+                "mapping_rms_ns": float(mapping.rms_ns),
+                "slope": float(slope),
+                "intercept_ns": float(intercept),
+            }
+
+        return predictions
+
+    # ------------------------------------------------------------------
+    def _mapping_state_snapshot(
+        self,
+    ) -> List[Tuple[str, float, float, int, float, float, int]]:
         with self._state_lock:
-            snapshot = {
-                player: (
+            return [
+                (
+                    player,
                     state.intercept_ns,
                     state.slope,
                     state.mapping_version,
                     state.confidence,
                     state.rms_ns,
                     state.sample_count,
-                    state.confidence_gate,
                 )
                 for player, state in self._player_states.items()
-            }
+            ]
 
-        predictions: Dict[str, Dict[str, float]] = {}
-        host_ns = float(t_host_ns)
-        for player, (
+    def _map_host_to_device_from_snapshot(
+        self,
+        snapshot: List[Tuple[str, float, float, int, float, float, int]],
+        t_ui_mono_ns: int,
+        tracker_id: Optional[str],
+    ) -> MappingResult:
+        selected: Optional[Tuple[str, float, float, int, float, float, int]] = None
+        if tracker_id is not None:
+            normalized = str(tracker_id).strip().lower()
+            for entry in snapshot:
+                name = entry[0]
+                if name.strip().lower() == normalized:
+                    selected = entry
+                    break
+        if selected is None:
+            selected = self._select_best_mapping_entry(snapshot)
+        if selected is None:
+            return MappingResult(None, 0, 0.0, 0)
+
+        (
+            _player,
             intercept,
             slope,
-            version,
+            mapping_version,
             confidence,
             rms_ns,
             sample_count,
-            confidence_gate,
-        ) in snapshot.items():
-            if sample_count < 2:
-                continue
-            if confidence < confidence_gate:
-                continue
-            if not math.isfinite(intercept) or not math.isfinite(slope):
-                continue
-            device_ns = intercept + slope * host_ns
-            mapped_ns = int(round(device_ns))
-            mapped_version = int(round(version))
-            mapped_rms = int(round(rms_ns))
-            predictions[player] = {
-                "t_device_ns": float(mapped_ns),
-                "mapping_version": float(mapped_version),
-                "mapping_confidence": float(confidence),
-                "mapping_rms_ns": float(mapped_rms),
-                "slope": float(slope),
-                "intercept_ns": float(intercept),
-            }
+        ) = selected
 
-        return predictions
+        t_device_ns: Optional[int] = None
+        if (
+            sample_count >= 2
+            and math.isfinite(intercept)
+            and math.isfinite(slope)
+            and confidence >= QC_CONFIDENCE_MIN
+            and rms_ns <= QC_RMS_NS_THRESHOLD
+        ):
+            predicted = intercept + slope * float(t_ui_mono_ns)
+            t_device_ns = int(round(predicted))
+
+        return MappingResult(
+            t_device_ns=t_device_ns,
+            mapping_version=int(mapping_version),
+            confidence=float(confidence),
+            rms_ns=int(round(rms_ns)),
+        )
+
+    @staticmethod
+    def _select_best_mapping_entry(
+        snapshot: List[Tuple[str, float, float, int, float, float, int]]
+    ) -> Optional[Tuple[str, float, float, int, float, float, int]]:
+        if not snapshot:
+            return None
+
+        def sort_key(entry: Tuple[str, float, float, int, float, float, int]) -> Tuple[
+            int, int, float, float, str
+        ]:
+            name, intercept, slope, _version, confidence, rms_ns, sample_count = entry
+            quality_ok = (
+                sample_count >= 2
+                and math.isfinite(intercept)
+                and math.isfinite(slope)
+                and confidence >= QC_CONFIDENCE_MIN
+                and rms_ns <= QC_RMS_NS_THRESHOLD
+            )
+            ready_rank = 0 if sample_count >= 2 else 1
+            return (
+                0 if quality_ok else 1,
+                ready_rank,
+                -confidence,
+                rms_ns,
+                name.lower(),
+            )
+
+        return min(snapshot, key=sort_key)
 
     # ------------------------------------------------------------------
     def start(self) -> None:
@@ -1299,4 +1394,4 @@ class TimeReconciler:
         return tuple(tail[-3:])  # type: ignore[return-value]
 
 
-__all__ = ["TimeReconciler"]
+__all__ = ["MappingResult", "TimeReconciler"]

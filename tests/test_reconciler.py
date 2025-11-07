@@ -13,6 +13,7 @@ if str(ROOT) not in sys.path:
 
 import pytest
 
+from core.config import QC_CONFIDENCE_MIN, QC_RMS_NS_THRESHOLD
 from tabletop.engine import EventLogger
 from tabletop.sync.reconciler import TimeReconciler
 
@@ -256,6 +257,73 @@ def test_predict_device_times_returns_empty_without_state() -> None:
     reconciler = TimeReconciler(bridge, logger, window_size=5)
 
     assert reconciler.predict_device_times(1_234_567_890) == {}
+
+
+def test_map_host_to_device_respects_quality_thresholds() -> None:
+    players = ["VP1"]
+    models = {"VP1": (18_000_000.0, 1.00002)}
+    bridge = _FakeBridge(players)
+    logger = _FakeLogger()
+    reconciler = TimeReconciler(bridge, logger, window_size=30)
+
+    start_ns = 6_500_000_000
+    for index in range(60):
+        t_local_ns = start_ns + index * 40_000_000
+        _inject_marker(reconciler, bridge, players, models, t_local_ns)
+
+    target_ns = start_ns + 250_000_000
+    stable = reconciler.map_host_to_device(target_ns, "VP1")
+    intercept, slope = models["VP1"]
+    expected = int(round(intercept + slope * target_ns))
+    assert stable.t_device_ns is not None
+    assert abs(stable.t_device_ns - expected) < 5_000_000
+
+    with reconciler._state_lock:
+        state = reconciler._player_states["VP1"]
+        state.confidence = QC_CONFIDENCE_MIN - 0.05
+
+    low_conf = reconciler.map_host_to_device(target_ns, "VP1")
+    assert low_conf.t_device_ns is None
+    assert low_conf.mapping_version == stable.mapping_version
+
+    with reconciler._state_lock:
+        state = reconciler._player_states["VP1"]
+        state.confidence = stable.confidence
+        state.rms_ns = float(QC_RMS_NS_THRESHOLD + 1)
+
+    high_rms = reconciler.map_host_to_device(target_ns, "VP1")
+    assert high_rms.t_device_ns is None
+    assert high_rms.mapping_version == stable.mapping_version
+
+
+def test_map_host_to_device_without_tracker_uses_best_mapping() -> None:
+    players = ["VP1", "VP2"]
+    models = {
+        "VP1": (10_000_000.0, 1.00001),
+        "VP2": (-3_000_000.0, 0.99999),
+    }
+    bridge = _FakeBridge(players)
+    logger = _FakeLogger()
+    reconciler = TimeReconciler(bridge, logger, window_size=30)
+
+    start_ns = 4_000_000_000
+    for index in range(60):
+        t_local_ns = start_ns + index * 35_000_000
+        _inject_marker(reconciler, bridge, players, models, t_local_ns)
+
+    target_ns = start_ns + 200_000_000
+    with reconciler._state_lock:
+        state = reconciler._player_states["VP2"]
+        state.confidence = QC_CONFIDENCE_MIN - 0.1
+
+    best = reconciler.map_host_to_device(target_ns)
+    assert best.t_device_ns is not None
+    intercept, slope = models["VP1"]
+    expected = int(round(intercept + slope * target_ns))
+    assert abs(best.t_device_ns - expected) < 5_000_000
+
+    repeat = reconciler.map_host_to_device(target_ns)
+    assert repeat == best
 
 
 def test_event_logger_supports_per_player_refinements(tmp_path: Path) -> None:
