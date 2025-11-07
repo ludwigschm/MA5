@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
 from http import HTTPStatus
+from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, Mapping, MutableMapping, Optional
+import traceback
 
 try:  # pragma: no cover - optional dependency, exercised in tests via monkeypatching
     import requests
@@ -30,6 +34,15 @@ _INITIAL_BACKOFF = 0.5
 # backend SDK or API happens to default to an upsert behaviour.
 _UPSERT_QUERY = {"upsert": "false"}
 
+append_only_mode = True
+
+_ALLOWED_PAYLOAD_KEYSETS = (
+    {"action", "actor", "player1_id"},
+    {"session_id", "action", "actor", "player1_id"},
+)
+
+_PAYLOAD_VIOLATION_LOG = Path("logs/cloud_payload_violation.log")
+
 if requests:  # pragma: no branch - hint for type checkers only
     _Session = requests.Session
     _RequestException = requests.RequestException
@@ -42,6 +55,49 @@ _session: Optional[_Session] = None
 
 class AppendEventError(RuntimeError):
     """Raised when an event could not be appended after retries."""
+
+
+def _log_payload_violation(payload: Mapping[str, Any], keys: set[str]) -> None:
+    """Record payload validation failures to a local log file."""
+
+    try:
+        _PAYLOAD_VIOLATION_LOG.parent.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.utcnow().isoformat(timespec="milliseconds") + "Z"
+        stack = "".join(traceback.format_stack())
+        with _PAYLOAD_VIOLATION_LOG.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "timestamp": timestamp,
+                        "keys": sorted(keys),
+                        "payload": dict(payload),
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            handle.write("\nTraceback (most recent call last):\n")
+            handle.write(stack)
+            handle.write("\n---\n")
+    except Exception:  # pragma: no cover - best effort logging
+        log.debug("Failed to persist payload violation", exc_info=True)
+
+
+def _ensure_minimal_payload(payload: Mapping[str, Any]) -> None:
+    keys = set(payload.keys())
+    if keys not in _ALLOWED_PAYLOAD_KEYSETS:
+        message = (
+            "Cloud payload must contain only action, actor, player1_id"
+            " and optional session_id"
+        )
+        _log_payload_violation(payload, keys)
+        raise ValueError(message)
+
+
+def _append_only_guard(api_name: str) -> bool:
+    if append_only_mode:
+        log.warning("%s is disabled because append_only_mode=True", api_name)
+        return True
+    return False
 
 
 def _get_session() -> _Session:
@@ -109,6 +165,8 @@ def append_event(payload: Dict[str, Any], *, idempotency_key: str) -> None:
     if not idempotency_key:
         raise ValueError("idempotency_key must be a non-empty string")
 
+    _ensure_minimal_payload(payload)
+
     append_url = _get_append_url()
     headers = _build_headers(idempotency_key)
 
@@ -163,5 +221,36 @@ def append_event(payload: Dict[str, Any], *, idempotency_key: str) -> None:
     raise AppendEventError("Append-only request failed") from last_error
 
 
-__all__ = ["append_event", "AppendEventError"]
+def update_event(*_args: Any, **_kwargs: Any) -> None:
+    """No-op helper retained for backwards compatibility."""
+
+    if _append_only_guard("update_event"):
+        return
+    raise RuntimeError("update_event is unavailable when append_only_mode is False")
+
+
+def upsert_event(*_args: Any, **_kwargs: Any) -> None:
+    """No-op helper retained for backwards compatibility."""
+
+    if _append_only_guard("upsert_event"):
+        return
+    raise RuntimeError("upsert_event is unavailable when append_only_mode is False")
+
+
+def refine_event(*_args: Any, **_kwargs: Any) -> None:
+    """No-op helper retained for backwards compatibility."""
+
+    if _append_only_guard("refine_event"):
+        return
+    raise RuntimeError("refine_event is unavailable when append_only_mode is False")
+
+
+__all__ = [
+    "append_event",
+    "AppendEventError",
+    "append_only_mode",
+    "refine_event",
+    "update_event",
+    "upsert_event",
+]
 
