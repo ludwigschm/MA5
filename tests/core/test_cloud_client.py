@@ -1,3 +1,4 @@
+import csv
 import json
 import threading
 import time
@@ -107,8 +108,8 @@ def test_payload_limited_to_whitelist_fields():
         client.close()
 
 
-def test_invalid_event_logged_and_not_sent(tmp_path: Path):
-    error_log = Path("logs/event_errors.log")
+def test_invalid_event_logged_and_not_sent():
+    error_log = Path("logs/event_errors.csv")
     if error_log.exists():
         error_log.unlink()
     spy = _TransportSpy()
@@ -130,8 +131,20 @@ def test_invalid_event_logged_and_not_sent(tmp_path: Path):
         client.close()
 
     assert error_log.exists()
-    contents = error_log.read_text(encoding="utf-8")
-    assert "Missing required field: action" in contents
+    with error_log.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        rows = list(reader)
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["reason"] == "Missing required field: action"
+    assert row["session_id"] == "sess-2"
+    assert row["block_idx"] == "1"
+    assert row["trial_idx"] == "2"
+    assert row["actor"] == "player"
+    assert row["player1_id"] == "p1"
+    assert row["action"] == ""
+    assert row["t_ui_mono_ns"] == "42"
 
 
 def test_high_priority_events_preserve_order_and_thread():
