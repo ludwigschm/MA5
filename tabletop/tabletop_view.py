@@ -30,6 +30,7 @@ from tabletop.data.config import ARUCO_OVERLAY_PATH, ROOT
 from core.events import BaseEvent, Priority
 from tabletop.logging import async_bridge
 from tabletop.logging.events import Events
+from tabletop.logging.policy import event_priority_for_action
 from tabletop.logging.ui_events import (
     UIEventLocalLogger,
     UIEventSender,
@@ -612,14 +613,20 @@ class TabletopRoot(FloatLayout):
         return payload
 
     def _dispatch_ui_event(
-        self, payload: BaseEvent, *, priority: Priority = "high"
+        self, payload: BaseEvent, *, priority: Priority | None = None
     ) -> None:
         sender = self._ui_event_sender
         if sender is None:
             return
+        computed_priority: Priority
+        if priority is None:
+            action = str(payload.get("action", ""))
+            computed_priority = event_priority_for_action(action)
+        else:
+            computed_priority = priority
         enriched = self._enrich_ui_event(payload)
         try:
-            sender.send_event(enriched, priority=priority)
+            sender.send_event(enriched, priority=computed_priority)
         except Exception:
             log.exception("Failed to dispatch UI event")
 
