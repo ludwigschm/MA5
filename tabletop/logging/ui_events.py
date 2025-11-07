@@ -128,6 +128,9 @@ class UIEventLocalLogger:
             key: ("" if payload.get(key) is None else payload.get(key))
             for key in _CSV_FIELDS
         }
+        sequence_no = payload.get("sequence_no")
+        if sequence_no is not None:
+            csv_row["sequence_no"] = sequence_no
         self._csv_logger.log_event(csv_row)
 
         values = tuple(payload.get(key) for key in _CSV_FIELDS)
@@ -172,6 +175,8 @@ class UIEventSender:
     ) -> None:
         self._local_logger = local_logger
         self._cloud_client = cloud_client
+        self._sequence_lock = threading.Lock()
+        self._sequence_counters: dict[tuple[str, str], int] = {}
 
     def send_event(self, payload: BaseEvent, priority: Priority = "normal") -> None:
         try:
@@ -179,6 +184,13 @@ class UIEventSender:
         except ValueError:
             log.exception("UI event payload failed validation")
             return
+
+        with self._sequence_lock:
+            key = (validated["session_id"], validated["actor"])
+            next_sequence = self._sequence_counters.get(key, 0) + 1
+            self._sequence_counters[key] = next_sequence
+
+        validated["sequence_no"] = next_sequence  # type: ignore[assignment]
 
         if self._local_logger is not None:
             try:
