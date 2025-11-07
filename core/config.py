@@ -43,6 +43,7 @@ EVENT_BATCH_WINDOW_MS: Final[int] = _get_int("EVENT_BATCH_WINDOW_MS", 0)
 EVENT_BATCH_SIZE: Final[int] = _get_int("EVENT_BATCH_SIZE", 20)
 QC_RMS_NS_THRESHOLD: Final[int] = _get_int("QC_RMS_NS_THRESHOLD", 5_000)
 QC_CONFIDENCE_MIN: Final[float] = _get_float("QC_CONFIDENCE_MIN", 0.9)
+CLOUD_SESSION_ID_REQUIRED: Final[bool] = _get_bool("CLOUD_SESSION_ID_REQUIRED", False)
 
 __all__ = [
     "LOW_LATENCY_DISABLED",
@@ -50,4 +51,5 @@ __all__ = [
     "EVENT_BATCH_SIZE",
     "QC_RMS_NS_THRESHOLD",
     "QC_CONFIDENCE_MIN",
+    "CLOUD_SESSION_ID_REQUIRED",
 ]
