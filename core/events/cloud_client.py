@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import json
 import logging
+import queue
 import threading
 import time
 from collections import deque
 from pathlib import Path
-from typing import Callable, Deque, Dict, Iterable, Literal, Mapping, MutableSequence
+from typing import Callable, Deque, Dict, Iterable, Literal, Mapping, MutableSequence, Tuple
 
 from core.config import EVENT_BATCH_SIZE, EVENT_BATCH_WINDOW_MS
 
@@ -31,6 +32,10 @@ _ALLOWED_FIELDS: tuple[str, ...] = (
     "mapping_version",
     "mapping_confidence",
 )
+
+
+_HIGH_SENTINEL = object()
+_HighQueueItem = tuple[Dict[str, object], Tuple[str, str], int | None]
 
 
 class CloudClient:
@@ -57,6 +62,14 @@ class CloudClient:
         self._queue: Deque[Dict[str, object]] = deque()
         self._timer: threading.Timer | None = None
         self._closed = False
+        self._high_queue: "queue.Queue[_HighQueueItem]" = queue.Queue()
+        self._high_thread = threading.Thread(
+            target=self._drain_high_priority_queue,
+            name="CloudClientHighPriority",
+            daemon=True,
+        )
+        self._high_thread.start()
+        self._high_last_sequence: Dict[Tuple[str, str], int] = {}
 
     # ------------------------------------------------------------------
     def send_event(self, payload: BaseEvent, priority: Priority = "normal") -> None:
@@ -82,7 +95,13 @@ class CloudClient:
             return
 
         if priority == "high":
-            self._send_batch((filtered,))
+            key = (validated["session_id"], validated["actor"])
+            sequence_obj = validated.get("sequence_no")  # type: ignore[assignment]
+            sequence_no = sequence_obj if isinstance(sequence_obj, int) else None
+            with self._lock:
+                if self._closed:
+                    return
+            self._high_queue.put((filtered, key, sequence_no))
             return
 
         with self._lock:
@@ -110,6 +129,7 @@ class CloudClient:
     def close(self) -> None:
         """Flush remaining events and prevent further sends."""
 
+        send_sentinel = False
         with self._lock:
             if self._closed:
                 batch: list[Dict[str, object]] = []
@@ -119,8 +139,12 @@ class CloudClient:
                     self._timer.cancel()
                     self._timer = None
                 batch = self._dequeue_locked(cancel_timer=False)
+                send_sentinel = True
         if batch:
             self._send_batch(batch)
+        if send_sentinel:
+            self._high_queue.put(_HIGH_SENTINEL)
+            self._high_thread.join()
 
     # ------------------------------------------------------------------
     def _dequeue_locked(
@@ -191,6 +215,21 @@ class CloudClient:
                 )
         except Exception:  # pragma: no cover - defensive logging
             log.exception("Failed to log validation error")
+
+
+    def _drain_high_priority_queue(self) -> None:
+        while True:
+            item = self._high_queue.get()
+            if item is _HIGH_SENTINEL:
+                break
+            payload, key, sequence_no = item
+            if sequence_no is not None:
+                last = self._high_last_sequence.get(key)
+                assert (
+                    last is None or sequence_no > last
+                ), f"High-priority sequence regression for {key}: {sequence_no} <= {last}"
+                self._high_last_sequence[key] = sequence_no
+            self._send_batch((payload,))
 
 
 __all__ = ["CloudClient", "Priority"]

@@ -1,4 +1,5 @@
 import json
+import threading
 import time
 from pathlib import Path
 from typing import List
@@ -23,9 +24,23 @@ def _base_event(**overrides):
 class _TransportSpy:
     def __init__(self) -> None:
         self.calls: List[str] = []
+        self.threads: List[str] = []
+        self._lock = threading.Lock()
 
     def __call__(self, payload: str) -> None:
-        self.calls.append(payload)
+        with self._lock:
+            self.calls.append(payload)
+            self.threads.append(threading.current_thread().name)
+
+
+def _wait_for_calls(spy: _TransportSpy, expected: int, timeout: float = 0.5) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with spy._lock:
+            if len(spy.calls) >= expected:
+                return
+        time.sleep(0.005)
+    raise AssertionError(f"Timed out waiting for {expected} transport calls")
 
 
 def test_high_priority_triggers_immediate_send():
@@ -33,7 +48,7 @@ def test_high_priority_triggers_immediate_send():
     client = CloudClient(spy, batch_window_s=0.5, batch_size=5)
     try:
         client.send_event(_base_event(trial_idx=5), priority="high")
-        assert len(spy.calls) == 1
+        _wait_for_calls(spy, 1)
         sent = json.loads(spy.calls[0])
         assert len(sent) == 1
         assert sent[0]["trial_idx"] == 5
@@ -72,6 +87,7 @@ def test_payload_limited_to_whitelist_fields():
             ),
             priority="high",
         )
+        _wait_for_calls(spy, 1)
         sent = json.loads(spy.calls[0])[0]
         assert set(sent.keys()) == {
             "session_id",
@@ -116,3 +132,20 @@ def test_invalid_event_logged_and_not_sent(tmp_path: Path):
     assert error_log.exists()
     contents = error_log.read_text(encoding="utf-8")
     assert "Missing required field: action" in contents
+
+
+def test_high_priority_events_preserve_order_and_thread():
+    spy = _TransportSpy()
+    client = CloudClient(spy, batch_window_s=0.5, batch_size=5)
+    try:
+        total = 8
+        for idx in range(total):
+            client.send_event(_base_event(trial_idx=idx), priority="high")
+
+        _wait_for_calls(spy, total)
+
+        payloads = [json.loads(call)[0]["trial_idx"] for call in spy.calls]
+        assert payloads == list(range(total))
+        assert len(set(spy.threads)) == 1
+    finally:
+        client.close()
