@@ -27,8 +27,10 @@ from kivy.uix.textinput import TextInput
 
 from tabletop.data.blocks import load_blocks, load_csv_rounds, value_to_card_path
 from tabletop.data.config import ARUCO_OVERLAY_PATH, ROOT
+from core.events import BaseEvent, Priority
 from tabletop.logging import async_bridge
 from tabletop.logging.events import Events
+from tabletop.logging.ui_events import UIEventLocalLogger, UIEventSender
 from tabletop.logging.round_csv import (
     close_round_log,
     init_round_log,
@@ -210,6 +212,7 @@ class TabletopRoot(FloatLayout):
         self._start_gate: Optional[StartGate] = None
         self._pending_session_start_payload: Optional[Dict[str, Any]] = None
         self._session_start_logged = False
+        self._ui_event_sender: Optional[UIEventSender] = None
 
         self._low_latency_disabled = is_low_latency_disabled()
         self.perf_logging = (
@@ -527,6 +530,93 @@ class TabletopRoot(FloatLayout):
             log.debug("%s completed in %.3f ms", name, duration_ms)
             self._handler_log_gate[name] = now
 
+    def _close_ui_event_sender(self) -> None:
+        sender = self._ui_event_sender
+        if sender is None:
+            return
+        try:
+            sender.close()
+        except Exception:
+            log.exception("Failed to close UI event sender")
+        finally:
+            self._ui_event_sender = None
+
+    def _install_ui_event_logging(self) -> None:
+        self._close_ui_event_sender()
+        session_label = self.session_storage_id or self.session_id
+        if not session_label:
+            return
+        try:
+            local_logger = UIEventLocalLogger(self.log_dir, session_label)
+        except Exception:
+            log.exception("Failed to initialise UI event logger")
+            self._ui_event_sender = None
+            return
+        self._ui_event_sender = UIEventSender(local_logger=local_logger)
+
+    def _player1_identifier(self) -> Optional[str]:
+        role = None
+        try:
+            role = self.role_by_physical.get(1)
+        except Exception:
+            role = None
+        if role in (1, 2):
+            return f"VP{role}"
+        return None
+
+    def _current_trial_index(self) -> Optional[int]:
+        try:
+            trial = int(self.round)
+        except (TypeError, ValueError):
+            trial = None
+        if trial is None or trial <= 0:
+            try:
+                trial = int(self.controller.compute_global_round())
+            except Exception:
+                trial = None
+        return trial if trial is not None and trial >= 0 else None
+
+    def _build_ui_event_payload(
+        self, *, action: str, actor: str, t_ui_ns: int
+    ) -> Optional[BaseEvent]:
+        session_id = self.session_id
+        block_idx = self._current_bridge_block_index()
+        trial_idx = self._current_trial_index()
+        player1_id = self._player1_identifier()
+        if (
+            not session_id
+            or block_idx is None
+            or trial_idx is None
+            or not actor
+            or not player1_id
+        ):
+            return None
+
+        payload: BaseEvent = {
+            "session_id": session_id,
+            "block_idx": int(block_idx),
+            "trial_idx": int(trial_idx),
+            "actor": actor,
+            "player1_id": player1_id,
+            "action": action,
+            "t_ui_mono_ns": int(t_ui_ns),
+        }
+        mapping_version = self._current_ab_version
+        if mapping_version:
+            payload["mapping_version"] = mapping_version
+        return payload
+
+    def _dispatch_ui_event(
+        self, payload: BaseEvent, *, priority: Priority = "high"
+    ) -> None:
+        sender = self._ui_event_sender
+        if sender is None:
+            return
+        try:
+            sender.send_event(payload, priority=priority)
+        except Exception:
+            log.exception("Failed to dispatch UI event")
+
     def stop_bridge_recordings(self) -> None:
         if not self._bridge_recordings_active:
             self._bridge_recording_block = None
@@ -802,6 +892,7 @@ class TabletopRoot(FloatLayout):
         db_path = self.log_dir / f'events_{safe_session_id}.sqlite3'
         self.session_storage_id = safe_session_id
         self.logger = self.events_factory(self.session_id, str(db_path))
+        self._install_ui_event_logging()
         self._ensure_time_reconciler()
         self._schedule_sync_heartbeat(immediate=True)
         init_round_log(self)
@@ -1281,6 +1372,13 @@ class TabletopRoot(FloatLayout):
             allowed_phase = self.phase in (UXPhase.WAIT_BOTH_START, UXPhase.SHOWDOWN)
             if not allowed_phase and not self.in_block_pause:
                 return
+            t0_ns = time.monotonic_ns()
+            actor = self._actor_label(who)
+            payload = self._build_ui_event_payload(
+                action="phase_transition", actor=actor, t_ui_ns=t0_ns
+            )
+            if payload is not None:
+                self._dispatch_ui_event(payload)
             if who == 1:
                 self.p1_pressed = True
             else:
@@ -1345,6 +1443,7 @@ class TabletopRoot(FloatLayout):
         try:
             if not self._input_debouncer.allow(f"tap:{who}:{which}"):
                 return
+            t0_ns = time.monotonic_ns()
             result = self.controller.tap_card(who, which)
             button_name = f'card_{which}'
             self._emit_button_bridge_event(
@@ -1357,6 +1456,12 @@ class TabletopRoot(FloatLayout):
             )
             if not result.allowed:
                 return
+            actor = self._actor_label(who)
+            payload = self._build_ui_event_payload(
+                action="card_flip", actor=actor, t_ui_ns=t0_ns
+            )
+            if payload is not None:
+                self._dispatch_ui_event(payload)
             widget = self.card_widget_for_player(who, which)
             if widget is None:
                 return
@@ -1375,6 +1480,7 @@ class TabletopRoot(FloatLayout):
         try:
             if not self._input_debouncer.allow(f"signal:{player}:{level}"):
                 return
+            t0_ns = time.monotonic_ns()
             result = self.controller.pick_signal(player, level)
             self._emit_button_bridge_event(
                 f'signal_{level}',
@@ -1386,6 +1492,12 @@ class TabletopRoot(FloatLayout):
             )
             if not result.accepted:
                 return
+            actor = self._actor_label(player)
+            payload = self._build_ui_event_payload(
+                action="bet", actor=actor, t_ui_ns=t0_ns
+            )
+            if payload is not None:
+                self._dispatch_ui_event(payload)
             for lvl, btn_id in self.signal_buttons.get(player, {}).items():
                 btn = self.wid_safe(btn_id)
                 if btn is None:
@@ -1410,6 +1522,7 @@ class TabletopRoot(FloatLayout):
         try:
             if not self._input_debouncer.allow(f"decision:{player}:{decision}"):
                 return
+            t0_ns = time.monotonic_ns()
             result = self.controller.pick_decision(player, decision)
             self._emit_button_bridge_event(
                 f'decision_{decision}',
@@ -1421,6 +1534,13 @@ class TabletopRoot(FloatLayout):
             )
             if not result.accepted:
                 return
+            actor = self._actor_label(player)
+            action_label = "call" if decision == "wahr" else "fold"
+            payload = self._build_ui_event_payload(
+                action=action_label, actor=actor, t_ui_ns=t0_ns
+            )
+            if payload is not None:
+                self._dispatch_ui_event(payload)
             for choice, btn_id in self.decision_buttons.get(player, {}).items():
                 btn = self.wid_safe(btn_id)
                 if btn is None:
