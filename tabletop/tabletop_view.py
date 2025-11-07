@@ -10,7 +10,7 @@ import uuid
 from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional, Tuple, cast
 
 import numpy as np
 from kivy.clock import Clock
@@ -30,7 +30,11 @@ from tabletop.data.config import ARUCO_OVERLAY_PATH, ROOT
 from core.events import BaseEvent, Priority
 from tabletop.logging import async_bridge
 from tabletop.logging.events import Events
-from tabletop.logging.ui_events import UIEventLocalLogger, UIEventSender
+from tabletop.logging.ui_events import (
+    UIEventLocalLogger,
+    UIEventSender,
+    log_mapping_warning,
+)
 from tabletop.logging.round_csv import (
     close_round_log,
     init_round_log,
@@ -208,6 +212,7 @@ class TabletopRoot(FloatLayout):
         self.round_log_writer = None
         self.round_log_buffer = []
         self.overlay_display_index = 0
+        self._last_mapping_warning_ts = 0.0
         self.start_gate_preroll_s = 5.0
         self._start_gate: Optional[StartGate] = None
         self._pending_session_start_payload: Optional[Dict[str, Any]] = None
@@ -612,10 +617,112 @@ class TabletopRoot(FloatLayout):
         sender = self._ui_event_sender
         if sender is None:
             return
+        enriched = self._enrich_ui_event(payload)
         try:
-            sender.send_event(payload, priority=priority)
+            sender.send_event(enriched, priority=priority)
         except Exception:
             log.exception("Failed to dispatch UI event")
+
+    def _enrich_ui_event(self, payload: BaseEvent) -> BaseEvent:
+        enriched: Dict[str, Any] = dict(payload)
+        enriched["t_utc_iso"] = datetime.utcnow().isoformat(timespec="milliseconds") + "Z"
+        for key, value in self._compute_device_time_fields(enriched).items():
+            enriched[key] = value
+        return cast(BaseEvent, enriched)
+
+    def _compute_device_time_fields(self, payload: Dict[str, Any]) -> Dict[str, Optional[Any]]:
+        fields: Dict[str, Optional[Any]] = {
+            "t_device_ns": None,
+            "t_device_vp1_ns": None,
+            "t_device_vp2_ns": None,
+            "mapping_version": None,
+            "mapping_confidence": None,
+            "mapping_rms_ns": None,
+        }
+
+        t_ui_ns = payload.get("t_ui_mono_ns")
+        if not isinstance(t_ui_ns, int):
+            return fields
+
+        reconciler = self._time_reconciler
+        if reconciler is None:
+            self._record_mapping_warning(payload, "reconciler_unavailable")
+            return fields
+
+        mapping = reconciler.predict_device_times(int(t_ui_ns))
+        if not mapping:
+            self._record_mapping_warning(payload, "mapping_unavailable")
+            return fields
+
+        per_device: Dict[str, Dict[str, Any]] = {}
+        for player, info in mapping.items():
+            lowered = str(player).strip().lower()
+            alias: Optional[str] = None
+            if lowered.endswith("vp1") or lowered.endswith("p1") or lowered == "vp1":
+                alias = "vp1"
+            elif lowered.endswith("vp2") or lowered.endswith("p2") or lowered == "vp2":
+                alias = "vp2"
+            if alias is not None:
+                per_device[alias] = info
+            else:
+                per_device[lowered] = info
+
+        if "vp1" in per_device:
+            t_vp1 = per_device["vp1"].get("t_device_ns")
+            fields["t_device_vp1_ns"] = int(t_vp1) if t_vp1 is not None else None
+        if "vp2" in per_device:
+            t_vp2 = per_device["vp2"].get("t_device_ns")
+            fields["t_device_vp2_ns"] = int(t_vp2) if t_vp2 is not None else None
+
+        chosen: Optional[Dict[str, Any]] = None
+        actor = str(payload.get("actor", "")).upper()
+        if actor == "P1":
+            chosen = per_device.get("vp1")
+        elif actor == "P2":
+            chosen = per_device.get("vp2")
+
+        if chosen is None and len(per_device) == 1:
+            chosen = next(iter(per_device.values()))
+        if chosen is None:
+            chosen = per_device.get("vp1") or per_device.get("vp2")
+        if chosen is None and mapping:
+            chosen = next(iter(mapping.values()))
+
+        if chosen is not None:
+            t_device = chosen.get("t_device_ns")
+            fields["t_device_ns"] = int(t_device) if t_device is not None else None
+
+            version = chosen.get("mapping_version")
+            fields["mapping_version"] = int(version) if version is not None else None
+
+            confidence = chosen.get("mapping_confidence")
+            fields["mapping_confidence"] = (
+                float(confidence) if confidence is not None else None
+            )
+
+            rms = chosen.get("mapping_rms_ns")
+            fields["mapping_rms_ns"] = int(rms) if rms is not None else None
+
+        return fields
+
+    def _record_mapping_warning(self, payload: Dict[str, Any], reason: str) -> None:
+        now = time.monotonic()
+        if now - self._last_mapping_warning_ts < 1.0:
+            return
+        self._last_mapping_warning_ts = now
+        try:
+            session = payload.get("session_id") or ""
+            block = payload.get("block_idx")
+            trial = payload.get("trial_idx")
+            actor = payload.get("actor") or ""
+            t_ui_ns = payload.get("t_ui_mono_ns")
+            message = (
+                f"reason={reason} session={session} block={block} "
+                f"trial={trial} actor={actor} t_ui_ns={t_ui_ns}"
+            )
+            log_mapping_warning(message)
+        except Exception:
+            log.debug("Failed to emit mapping warning", exc_info=True)
 
     def stop_bridge_recordings(self) -> None:
         if not self._bridge_recordings_active:

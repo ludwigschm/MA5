@@ -147,6 +147,55 @@ class TimeReconciler:
                 return 0
             return max(state.mapping_version for state in self._player_states.values())
 
+    def predict_device_times(self, t_host_ns: int) -> Dict[str, Dict[str, float]]:
+        """Return predicted device timestamps and metadata for *t_host_ns*."""
+
+        with self._state_lock:
+            snapshot = {
+                player: (
+                    state.intercept_ns,
+                    state.slope,
+                    state.mapping_version,
+                    state.confidence,
+                    state.rms_ns,
+                    state.sample_count,
+                    state.confidence_gate,
+                )
+                for player, state in self._player_states.items()
+            }
+
+        predictions: Dict[str, Dict[str, float]] = {}
+        host_ns = float(t_host_ns)
+        for player, (
+            intercept,
+            slope,
+            version,
+            confidence,
+            rms_ns,
+            sample_count,
+            confidence_gate,
+        ) in snapshot.items():
+            if sample_count < 2:
+                continue
+            if confidence < confidence_gate:
+                continue
+            if not math.isfinite(intercept) or not math.isfinite(slope):
+                continue
+            device_ns = intercept + slope * host_ns
+            mapped_ns = int(round(device_ns))
+            mapped_version = int(round(version))
+            mapped_rms = int(round(rms_ns))
+            predictions[player] = {
+                "t_device_ns": float(mapped_ns),
+                "mapping_version": float(mapped_version),
+                "mapping_confidence": float(confidence),
+                "mapping_rms_ns": float(mapped_rms),
+                "slope": float(slope),
+                "intercept_ns": float(intercept),
+            }
+
+        return predictions
+
     # ------------------------------------------------------------------
     def start(self) -> None:
         if self._worker and self._worker.is_alive():
