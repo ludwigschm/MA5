@@ -650,6 +650,12 @@ class TabletopApp(App):
                 if callable(close_fn):
                     close_fn()
                 root.logger = None
+            ui_sender = getattr(root, "_ui_event_sender", None)
+            if ui_sender is not None:
+                close_fn = getattr(ui_sender, "close", None)
+                if callable(close_fn):
+                    close_fn()
+                root._ui_event_sender = None
             flush_round_log(
                 root,
                 force=True,
